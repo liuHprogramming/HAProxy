@@ -1,0 +1,83 @@
+First a new bridged network (in this case i name it hapnet) is created, along with some parameters:
+
+--driver: specifies the driver for the network
+--internal: restrict external network access
+$ docker network create --driver bridge --internal hapnet
+The application containers are then connect to the hapnet network with the --net parameter. That way they are not directly accessible from outside but can communicate among each other.
+
+$ docker run -d --restart always --name frn --net hapnet frontend:latest
+$ docker run -d --restart always --name bck --net hapnet backend:latest
+Then the HAProxy container is started, connected to the default bridge, exposing the desired and configured ports 80 and 443.
+
+dockerContainer.cfg:
+
+global
+tune.ssl.default-dh-param 2048
+maxconn 100
+daemon
+
+defaults
+mode http
+
+    timeout connect  4s
+    timeout http-request  1s
+    timeout http-keep-alive  120s
+    timeout client  1m
+    timeout server  1m
+    timeout queue  10s
+
+    option splice-auto
+    option dontlog-normal
+    option tcp-smart-accept
+    option tcp-smart-connect
+    option forwardfor
+    option http-keep-alive
+
+    http-reuse safe
+
+frontend www-http
+bind :80
+reqadd X-Forwarded-Proto:\ http
+
+    # hosts
+    acl host_frn hdr(host) -i front.example.com
+    acl host_bck hdr(host) -i back.example.com
+
+    # https redirect
+    redirect scheme https code 301 if !{ ssl_fc } host_frn OR !{ ssl_fc } host_bck
+
+frontend www-https
+bind :443 ssl crt /usr/local/etc/haproxy/example.com.pem
+reqadd X-Forwarded-Proto:\ https
+
+    # hosts
+    acl host_frn hdr(host) -i front.example.com
+    acl host_bck hdr(host) -i back.example.com
+
+    # backends
+    use_backend front if host_frn
+    use_backend front if host_bck
+
+resolvers docker
+nameserver dns1 127.0.0.11:53
+
+backend front
+server front frn:80 check inter 10s resolvers docker
+
+backend back
+server back bck:80 check inter 10s resolvers docker
+
+And here’s a little hiccup: the execution will fail, because at this point HAProxy does not see the other containers, as it is in the wrong network. Therefore the container will exit immediately and the logs will show something like:
+
+This is why the container is started with --restart always so it will try to come up after it exited. The container could be connected even if it is exited, but I want it to restart always either way.
+
+$ docker run -d -p 443:443 -p 80:80 --restart always --name haproxy -v /home/.../config:/usr/local/etc/haproxy:ro haproxy:1.7-alpine
+
+or:
+$ docker run -d -p 443:443 -p 80:80 --restart always --name haproxy -v /home/.../config:/usr/local/etc/dockerContainer.cfg haproxy:1.7-alpine
+
+Now it needs to be connected to the hapnet network, and from that point on HAProxy will see the other containers.
+
+$ docker network connect hapnet haproxy
+
+When the HAProxy container is run, the configuration folder is mounted into it, containing the haproxy.cfg configuration file as well as the TLS certificate(s). HAProxy resolves a hostname’s IP on start, so whenever a container’s IP changes we’ve got a problem. To avoid this, we can use a resolver to specify a DNS. Docker provides such a DNS and we can use it in HAProxy. Last but not least we need to tell the backends to use that resolver and choose an appropriate TTL.
